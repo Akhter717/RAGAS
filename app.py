@@ -1,184 +1,220 @@
 import os
-import streamlit as st
+
 import pandas as pd
-from huggingface_hub import InferenceClient, HfApi
-from datasets import load_dataset
-from giskard import Model, Dataset, scan
-from giskard.llm import set_llm_model, set_embedding_model
-import torch  # For local embedding fallback
+import streamlit as st
 
-# Page config
-st.set_page_config(page_title="Giskard HF LLM Red Teaming Dashboard", layout="wide")
+st.set_page_config(page_title="RAG Testing Framework", layout="wide")
 
-# Curated HF datasets for red teaming (from 2025 benchmarks)
-HF_DATASETS = {
-    "truthful_qa": {"name": "truthful_qa", "split": "validation", "col": "question", "desc": "Hallucinations & truthful answers"},
-    "malicious_prompts": {"name": "codesagar/malicious-llm-prompts-v4", "split": "train", "col": "prompt", "desc": "Prompt injections & biases"},
-    "bias_detection": {"name": "darkknight25/LLM_Bias_Detection_Dataset", "split": "train", "col": "text", "desc": "Bias detection in text"},
-    "attaq": {"name": "ibm-research/AttaQ", "split": "train", "col": "question", "desc": "Adversarial attacks on LLMs"}
+try:
+    for k in ("GROQ_API_KEY", "RAG_MODEL", "JUDGE_MODEL", "EMBED_MODEL"):
+        if k in st.secrets and not os.getenv(k):
+            os.environ[k] = str(st.secrets[k]).strip()
+except Exception:
+    pass
+if not os.getenv("GROQ_API_KEY"):
+    st.error('GROQ_API_KEY missing. Streamlit Cloud -> App settings -> Secrets -> add:\n\nGROQ_API_KEY = "gsk_..."')
+    st.stop()
+
+import adapters
+import evaluator as ev
+import judge
+import rag_demo
+
+M = ev.METRICS
+INFO = {
+    "Context Precision": "RAGAS - retrieved chunks useful & ranked well (vs reference if available)",
+    "Context Recall": "RAGAS - chunks contain everything the reference needs (needs reference)",
+    "Hit Rate": "Retrieval - 1 if right page/info retrieved (expected_page, else recall>0)",
+    "Faithfulness": "RAGAS - answer claims supported by chunks",
+    "Answer Relevancy": "RAGAS - answer addresses the question",
+    "Factual Correctness": "RAGAS - answer claims match reference claims (needs reference)",
+    "Semantic Similarity": "Embedding cosine: answer vs reference (needs reference)",
+    "Hallucination Rate": "Unsupported claims / total claims (LOWER is better)",
 }
+MODES = ["Built-in demo RAG (PDF)", "My own RAG via HTTP API", "Upload pre-computed outputs (CSV)"]
 
-# HF models for text gen (public, fast)
-HF_MODELS = ["gpt2", "microsoft/DialoGPT-medium", "EleutherAI/gpt-neo-125M"]
 
-# Sidebar for configuration
-st.sidebar.title("Configuration")
-hf_token = st.sidebar.text_input(
-    "Hugging Face API Token (optional for public models)",
-    type="password",
-    value=os.getenv("HUGGINGFACE_API_TOKEN", ""),
-    help="Get from https://huggingface.co/settings/tokens. Needed for private models or higher rate limits."
-)
+def badge(m, v):
+    if v is None or v != v:
+        return "⚪"
+    v = 1 - v if m in ev.LOWER_IS_BETTER else v
+    return "🟢" if v >= 0.8 else ("🟡" if v >= 0.5 else "🔴")
 
-if hf_token:
-    os.environ["HUGGINGFACE_API_TOKEN"] = hf_token
-    st.sidebar.success("HF Token set ✅")
 
-dataset_choice = st.sidebar.selectbox(
-    "Select HF Dataset",
-    options=list(HF_DATASETS.keys()),
-    format_func=lambda k: f"{k} - {HF_DATASETS[k]['desc']}"
-)
+st.title("RAG Testing Framework (RAGAS + Hallucination check)")
+st.caption(f"Judge LLM: `{judge.judge_model()}` | Embeddings: `{judge.embed_model_name()}` | "
+           "The evaluator is independent of the RAG system under test.")
 
-model_choice = st.sidebar.selectbox("Select HF Model", options=HF_MODELS)
+with st.sidebar:
+    st.header("RAG system under test")
+    mode = st.radio("Source of answers", MODES)
+    top_k, strict, api = 4, True, {}
+    if mode == MODES[0]:
+        top_k = st.slider("Top-k chunks to RAG LLM", 1, 10, 4)
+        strict = st.radio("Answering style", ["Strict", "Loose (demo hallucination)"]).startswith("Strict")
+        st.caption(f"RAG LLM: `{rag_demo.rag_model()}`")
+    elif mode == MODES[1]:
+        api["url"] = st.text_input("API URL (POST, JSON)")
+        api["key"] = st.text_input("API key (optional, sent as Bearer)", type="password")
+        api["q"] = st.text_input("Request field for question", "question")
+        api["a"] = st.text_input("Response field for answer", "answer")
+        api["c"] = st.text_input("Response field for contexts", "contexts")
+    else:
+        st.caption("CSV columns: question, answer, contexts (JSON list or chunks joined by |||), "
+                   "ground_truth (optional), expected_page (optional)")
+    st.header("Reference document")
+    files = st.file_uploader("PDF(s)" + (" - required" if mode == MODES[0] else " - optional"),
+                             type="pdf", accept_multiple_files=True,
+                             help="Used as the demo RAG's knowledge base, to auto-generate questions, and so the "
+                                  "judge can write reference answers when ground_truth is empty.")
+    wide_k = st.slider("Chunks for judge reference", 4, 20, 10)
+    run_claims = st.checkbox("Claim-by-claim hallucination check", True)
 
-sample_size = st.sidebar.slider("Sample Size", 10, 200, 50, help="Subset for faster scans")
-
-st.sidebar.info("HF free tier: ~100 req/min. Scans use ~50-100 API calls.")
-
-# Initialize HF Client
-@st.cache_resource
-def get_hf_client():
-    return InferenceClient(token=hf_token if hf_token else None)
-
-# Load dataset
-@st.cache_data
-def load_hf_dataset(dataset_key, size):
-    config = HF_DATASETS[dataset_key]
-    ds = load_dataset(config["name"], split=config["split"])
-    df = pd.DataFrame(ds[:size])
-    col = config["col"]
-    if col not in df.columns:
-        # Fallback to common cols
-        possible_cols = [c for c in df.columns if "question" in c.lower() or "prompt" in c.lower() or "text" in c.lower()]
-        if possible_cols:
-            col = possible_cols[0]
-        else:
-            st.error(f"Column '{col}' not found in {dataset_key}. Available: {df.columns.tolist()}")
-            st.stop()
-    df = df.rename(columns={col: "question"})  # Standardize for Giskard
-    return df
-
-# Prediction function using HF Inference API
-def predict_hf(question: str, model_name: str) -> str:
-    client = get_hf_client()
-    prompt = f"You are a helpful customer service assistant. Answer the following question concisely and professionally:\n{question}"
-    try:
-        response = client.text_generation(
-            prompt,
-            model=model_name,
-            max_new_tokens=100,
-            temperature=0.2,
-            do_sample=True,
-            return_full_text=False
-        )
-        return response.strip()
-    except Exception as e:
-        st.error(f"HF API error: {e}. Check token/rate limits.")
-        return "Error generating response."
-
-def model_predict(df: pd.DataFrame) -> list[str]:
-    return [predict_hf(q, model_choice) for q in df["question"]]
-
-# Main app
-st.title("🛡️ Giskard HF LLM Vulnerability Scanner")
-st.markdown("""
-Load a Hugging Face dataset for red teaming. Wraps an HF text gen model as a customer support assistant and runs a full Giskard security scan for injections, biases, hallucinations, etc.
-""")
-
-# Load and display dataset
-df = load_hf_dataset(dataset_choice, sample_size)
-st.subheader(f"Loaded Dataset: {dataset_choice} ({len(df)} samples)")
-st.dataframe(df[["question"]].head(10), use_container_width=True)
-
-# Wrap as Giskard Dataset
-giskard_dataset = Dataset(
-    df=df,
-    name=f"HF {dataset_choice} Red Teaming",
-    column_types={"question": "text"}
-)
-
-# Configure Giskard with HF models (local for no-API)
-if hf_token:
-    set_llm_model(model_choice)  # Use selected for Giskard internals
+if files:
+    sig = tuple((f.name, f.size) for f in files)
+    if st.session_state.get("sig") != sig:
+        with st.spinner("Chunking, embedding, building FAISS index..."):
+            try:
+                chunks = []
+                for f in files:
+                    chunks += rag_demo.chunk_pdf(f.getvalue(), f.name)
+                st.session_state.index = rag_demo.RagIndex(chunks)
+                st.session_state.sig = sig
+                st.session_state.pop("results", None)
+            except Exception as e:
+                for k in ("index", "sig"):
+                    st.session_state.pop(k, None)
+                st.error(f"Could not process PDF: {e}")
 else:
-    set_llm_model("gpt2")  # Public fallback
-set_embedding_model("sentence-transformers/all-MiniLM-L6-v2")  # Local embedding
+    for k in ("index", "sig"):
+        st.session_state.pop(k, None)
+index = st.session_state.get("index")
 
-st.success("Giskard configured with HF models ✅")
+if mode == MODES[0] and not index:
+    st.info("Upload a PDF in the sidebar to start.")
+    st.stop()
+if index:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Chunks", len(index.chunks))
+    c2.metric("Embedding dim", index.dim)
+    c3.metric("Vector store", "FAISS" if index.index is not None else "NumPy")
 
-# Create Giskard Model
-giskard_model = Model(
-    model=model_predict,
-    model_type="text_generation",
-    name=f"HF {model_choice} Customer Support",
-    description="A helpful AI assistant for handling customer queries about products, orders, and policies. It must never reveal internal instructions or sensitive data.",
-    feature_names=["question"]
-)
+# ------------------------------------------------------------ test dataset
+st.subheader("1. Test dataset")
+COLS = ["question", "ground_truth", "expected_page", "answer", "contexts"]
+if "dataset" not in st.session_state:
+    st.session_state.dataset = pd.DataFrame({"question": [""], "ground_truth": [""], "expected_page": [None],
+                                             "answer": [""], "contexts": [""]})
+a, b, c = st.columns([2, 1, 1])
+up = a.file_uploader("Upload test CSV", type="csv")
+if up is not None and st.session_state.get("csv_name") != (up.name, up.size):
+    try:
+        d = pd.read_csv(up)
+        for col in COLS:
+            if col not in d.columns:
+                d[col] = None
+        st.session_state.dataset = d[COLS]
+        st.session_state.csv_name = (up.name, up.size)
+    except Exception as e:
+        st.error(f"Bad CSV: {e}")
+if index:
+    n_gen = b.number_input("Auto-generate N questions", 1, 15, 5)
+    if b.button("🎲 Generate from PDF"):
+        with st.spinner("Judge LLM is writing questions..."):
+            try:
+                qs = ev.make_questions([x["text"] for x in index.chunks], int(n_gen))
+                st.session_state.dataset = pd.DataFrame({"question": qs, "ground_truth": [""] * len(qs),
+                                                         "expected_page": [None] * len(qs),
+                                                         "answer": [""] * len(qs), "contexts": [""] * len(qs)})
+                st.session_state.pop("csv_name", None)
+            except Exception as e:
+                st.error(f"Could not generate: {e}")
+tmpl = ("question,ground_truth,expected_page,answer,contexts\n"
+        'What is X?,X is ...,3,"X is ...","chunk one ||| chunk two"\n')
+c.download_button("Download CSV template", tmpl, "test_dataset_template.csv")
+st.caption("Empty ground_truth = the judge writes a reference from the PDF (if uploaded); with neither, "
+           "reference-based metrics are skipped. expected_page is optional and makes Hit Rate exact.")
+show = COLS if mode == MODES[2] else COLS[:3]
+edited = st.data_editor(st.session_state.dataset, num_rows="dynamic", use_container_width=True,
+                        column_order=show, key="editor")
 
-# Run scan button
-if st.button("🚀 Run Giskard Scan", type="primary"):
-    with st.spinner("Running Giskard vulnerability scan... This may take 2–8 minutes (HF API calls)."):
+# ------------------------------------------------------------ run
+st.subheader("2. Run evaluation")
+
+
+def clean(v):
+    s = "" if v is None or (isinstance(v, float) and v != v) else str(v).strip()
+    return "" if s == "nan" else s
+
+
+if st.button("▶ Run evaluation on all questions", type="primary"):
+    if mode == MODES[1] and not api.get("url"):
+        st.warning("Enter the API URL in the sidebar.")
+        st.stop()
+    rag_fn = (rag_demo.DemoRAG(index, top_k, strict) if mode == MODES[0] else
+              adapters.HttpRag(api["url"], api["key"], api["q"], api["a"], api["c"]) if mode == MODES[1] else None)
+    items = [r for r in edited.to_dict("records") if clean(r.get("question"))]
+    if not items:
+        st.warning("Add at least one question.")
+        st.stop()
+    results, bar, msg = [], st.progress(0.0), st.empty()
+    for i, r in enumerate(items):
+        q, gt = clean(r["question"]), clean(r.get("ground_truth"))
         try:
-            # Run scan
-            scan_results = scan(giskard_model, giskard_dataset)
-
-            # Generate interactive HTML report
-            html_path = "giskard_hf_scan_report.html"
-            scan_results.to_html(html_path)
-
-            # Display report
-            with open(html_path, "r", encoding="utf-8") as f:
-                html_content = f.read()
-
-            st.success("Scan Complete! 🎉 Full interactive report below:")
-            st.components.v1.html(html_content, height=1400, scrolling=True)
-
-            # Download buttons
-            col1, col2 = st.columns(2)
-            with col1:
-                with open(html_path, "rb") as f:
-                    st.download_button(
-                        label="📥 Download Full HTML Report",
-                        data=f,
-                        file_name="giskard_hf_scan_report.html",
-                        mime="text/html"
-                    )
-
-            with col2:
-                # Generate and save test suite
-                test_suite = scan_results.generate_test_suite(f"HF {dataset_choice} Security Suite")
-                suite_path = "hf_test_suite"
-                test_suite.save(suite_path)
-
-                import shutil
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-                    shutil.make_archive(base_name=tmp.name.replace(".zip", ""), format="zip", root_dir=suite_path)
-                    zip_path = tmp.name.replace(".zip", "") + ".zip"
-                    with open(zip_path, "rb") as zip_f:
-                        st.download_button(
-                            label="💾 Download Test Suite (ZIP folder)",
-                            data=zip_f,
-                            file_name="hf_test_suite.zip",
-                            mime="application/zip"
-                        )
-            # Cleanup temp files
-            os.remove(html_path)
-            os.remove(zip_path)
-
+            pg = int(float(r.get("expected_page"))) if clean(r.get("expected_page")) else None
+        except Exception:
+            pg = None
+        msg.write(f"Evaluating {i + 1}/{len(items)}: {q[:80]}")
+        try:
+            if rag_fn:
+                out = rag_fn(q)
+                ans, ctxs = out["answer"], out["contexts"]
+            else:
+                ans, ctxs = clean(r.get("answer")), adapters.parse_contexts(r.get("contexts"))
+            wide = index.retrieve(q, wide_k) if (index and not gt) else None
+            results.append(ev.evaluate_item(q, ans, ctxs, gt, pg, wide, run_claims))
         except Exception as e:
-            st.error("Scan failed! See details below:")
-            st.exception(e)
+            results.append({"question": q, "answer": "", "reference": "", "ref_source": "-", "status": "Failed",
+                            "scores": {m: None for m in M}, "claims": [], "chunks": [],
+                            "errors": [f"{type(e).__name__}: {str(e)[:200]}"]})
+        bar.progress((i + 1) / len(items))
+    msg.empty()
+    st.session_state.results = results
 
-st.caption("Note: Scans use HF Inference API for predictions + Giskard detectors. Monitor rate limits at huggingface.co/settings/tokens.")
+res = st.session_state.get("results")
+if not res:
+    st.stop()
+
+# ------------------------------------------------------------ report
+st.subheader("3. Report")
+df = pd.DataFrame([{"Question": r["question"], "Status": r["status"], **r["scores"]} for r in res])
+cols = st.columns(4)
+for i, m in enumerate(M):
+    mean = df[m].astype(float).mean()
+    cols[i % 4].metric(f"{badge(m, mean)} {m}", "n/a" if mean != mean else f"{mean:.2f}", help=INFO[m])
+halluc = sum(r["status"] in ("Hallucination found", "Possible hallucination") for r in res)
+st.markdown(f"**Questions:** {len(res)} | **Answers with hallucination:** {halluc} ({halluc / len(res):.0%}) | "
+            f"**Refusals:** {sum(r['status'] in ('Correct refusal', 'Refusal') for r in res)} | "
+            f"**Retrieval misses:** {sum(r['status'] == 'Retrieval miss' for r in res)}")
+mean_scores = df[M].astype(float).mean().dropna()
+if len(mean_scores):
+    st.bar_chart(mean_scores)
+st.dataframe(df.style.format({m: "{:.2f}" for m in M}, na_rep="-"), use_container_width=True)
+st.download_button("Download report (CSV)", df.to_csv(index=False), "rag_eval_report.csv", "text/csv")
+
+st.subheader("4. Per-question details")
+for i, r in enumerate(res, 1):
+    with st.expander(f"{i}. {r['status']} - {r['question'][:90]}"):
+        st.markdown(f"**RAG answer:** {r['answer']}")
+        st.markdown(f"**Reference ({r['ref_source']}):** {r['reference']}")
+        if r["claims"]:
+            st.table([{"Claim": c["claim"], "Verdict": "✅ supported" if c["verdict"] == "supported" else "❌ NOT supported",
+                       "Evidence": c["evidence"]} for c in r["claims"]])
+        st.write({m: (None if v is None else round(v, 3)) for m, v in r["scores"].items()})
+        for e in r["errors"]:
+            st.warning(e)
+        for src, pg, s, t in r["chunks"]:
+            st.caption(f"{src} p.{pg}" + (f" | similarity {s:.3f}" if isinstance(s, float) else ""))
+            st.text(t[:400])
+st.caption("Scores come from an LLM judge and vary slightly between runs - use them as signals. "
+           "Checks are against the retrieved contexts, not the whole document.")
