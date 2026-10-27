@@ -1,0 +1,11 @@
+question,ground_truth,expected_page
+How many days of annual leave does a full-time employee get per year?,22 days of annual leave per year.,1
+After how many consecutive days of sick leave is a medical certificate required?,A medical certificate is required when sick leave exceeds 2 consecutive days.,1
+On which days must employees work from the office?,"Tuesday, Wednesday and Thursday.",2
+How much is the monthly work-from-home allowance and what is it for?,"Rs 1,500 per month, paid towards internet costs.",2
+What are the password length and password change rules?,Passwords must be at least 14 characters and changed every 90 days.,3
+Within how many hours must a lost company device be reported?,"Within 2 hours of discovery, by emailing the security team.",3
+What is the hotel limit per night in metro cities?,"Rs 6,500 per night in metro cities.",4
+Within how many days must expense claims be submitted?,Within 30 days of the expense date.,4
+What is the company's stock option vesting schedule?,,
+What is the annual performance bonus percentage for managers?,,
