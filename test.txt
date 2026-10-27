@@ -1,0 +1,4 @@
+GROQ_API_KEY = "gsk_..."
+RAG_MODEL = "openai/gpt-oss-20b"
+JUDGE_MODEL = "openai/gpt-oss-120b"
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"
