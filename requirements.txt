@@ -1,8 +1,10 @@
-streamlit==1.38.0
-pandas==2.2.3
-giskard[llm]==1.2.0  # Latest OSS with HF support
-huggingface_hub==0.25.0  # For InferenceClient
-datasets==3.0.1  # HF datasets loader
-transformers==4.46.0  # For local embeddings/models
-torch==2.5.0  # CPU-only for Cloud
-sentence-transformers==3.1.1  # Local embedding fallback
+streamlit
+pandas
+pypdf
+numpy
+groq
+fastembed
+faiss-cpu
+ragas==0.2.10
+langchain-groq
+requests
